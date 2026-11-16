@@ -28,7 +28,6 @@ jobs:
 
       - name: Tum Proje ve Kotlin Kaynak Dosyalarini Olustur
         run: |
-          # Eski yanlis yerlesimli dosyalari temizle ve dogru agaci kur
           rm -rf app build settings.gradle.kts build.gradle.kts gradle.properties
           mkdir -p app/src/main/java/com/s23ultra/focusstack
           echo "sdk.dir=$ANDROID_HOME" > local.properties
@@ -81,7 +80,7 @@ jobs:
                   minSdk = 29
                   targetSdk = 34
                   versionCode = 3
-                  versionName = "2.1-S23U-FullRes"
+                  versionName = "3.0-S23U"
               }
 
               buildTypes {
@@ -138,9 +137,6 @@ jobs:
           import android.graphics.Bitmap
           import android.graphics.BitmapFactory
           import android.graphics.Matrix
-          import android.graphics.BitmapRegionDecoder
-          import android.graphics.Rect
-          import kotlin.coroutines.coroutineContext
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.ensureActive
           import kotlinx.coroutines.withContext
@@ -149,20 +145,19 @@ jobs:
           import kotlin.math.abs
           import kotlin.math.max
           import kotlin.math.min
+          import kotlin.math.pow
           import kotlin.math.roundToInt
 
           object FocusStackProcessor {
 
-              // 32-pixel grid preserves the phase of all six pyramid levels.
-              private const val TILE_SIDE = 512
-              private const val TILE_HALO = 192
+              const val MAX_WORK_SIDE = 3072
+              private const val EST_MAX_SIDE = 1280
               private const val PYRAMID_LEVELS = 6
-              private const val EST_MAX_SIDE = 1024
-              private val BLUR3 = floatArrayOf(0.25f, 0.5f, 0.25f)
+              private val GAUSS5 = floatArrayOf(1f / 16f, 4f / 16f, 6f / 16f, 4f / 16f, 1f / 16f)
               private val BOX7 = FloatArray(7) { 1f / 7f }
 
               private class Img(val w: Int, val h: Int, val d: FloatArray)
-              private class EstPyr(val k0: Int, val levels: List<Img>)
+              private class EstPyr(val levels: List<Img>)
 
               private inline fun parFor(n: Int, crossinline body: (Int) -> Unit) {
                   IntStream.range(0, n).parallel().forEach { i -> body(i) }
@@ -171,75 +166,113 @@ jobs:
               suspend fun stack(
                   files: List<File>,
                   rotationDeg: Int,
-                  onProgress: (done: Int, total: Int) -> Unit
+                  onProgress: (stage: String, done: Int, total: Int) -> Unit
               ): Bitmap = withContext(Dispatchers.Default) {
                   require(files.size >= 2) { "En az 2 kare gerekli" }
-                  val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                  BitmapFactory.decodeFile(files[0].path, bounds)
-                  val W = bounds.outWidth
-                  val H = bounds.outHeight
-                  require(W >= 64 && H >= 64 && W.toLong() * H <= 16_000_000L) {
-                      "Desteklenmeyen kaynak boyutu: ${W}x${H} (en fazla 16 MP)"
-                  }
-                  for (file in files) {
-                      BitmapFactory.decodeFile(file.path, bounds)
-                      require(bounds.outWidth == W && bounds.outHeight == H) { "Kare boyutlari farkli" }
-                  }
-                  // Estimate once at low resolution; fuse the original JPEG pixels without resizing.
-                  var factor = 1
-                  while (max(W, H) / factor > EST_MAX_SIDE) factor *= 2
-                  val ew = max(64, W / factor)
-                  val eh = max(64, H / factor)
-                  val refIdx = files.size / 2
-                  val reference = buildEstPyr(decode(files[refIdx], ew, eh), ew, eh)
-                  val transforms = Array(files.size) { doubleArrayOf(1.0, 0.0, 0.0) }
-                  val tiles = ((W + TILE_SIDE - 1) / TILE_SIDE) * ((H + TILE_SIDE - 1) / TILE_SIDE)
-                  val total = files.size * (tiles + 1)
-                  var done = 0
-                  for (i in files.indices) {
+
+                  val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  BitmapFactory.decodeFile(files[0].path, bo)
+                  val srcW = bo.outWidth
+                  val srcH = bo.outHeight
+
+                  val workScale = min(1f, MAX_WORK_SIDE.toFloat() / max(srcW, srcH))
+                  val W = max(64, (srcW * workScale).roundToInt())
+                  val H = max(64, (srcH * workScale).roundToInt())
+
+                  val estScale = min(1f, EST_MAX_SIDE.toFloat() / max(srcW, srcH))
+                  val eW = max(64, (srcW * estScale).roundToInt())
+                  val eH = max(64, (srcH * estScale).roundToInt())
+
+                  val n = files.size
+                  val refIdx = n / 2
+
+                  // 1. ASAMA: Dusuk cozunurlukte siralı komsu hizalama + gurultusuz keskinlik haritalari
+                  val lumas = Array(n) { FloatArray(eW * eH) }
+                  val pyrs = arrayOfNulls<EstPyr>(n)
+                  for (i in 0 until n) {
                       ensureActive()
-                      if (i != refIdx) {
-                          val t = estimate(reference, buildEstPyr(decode(files[i], ew, eh), ew, eh), ew, eh)
-                          t[1] *= W.toDouble() / ew
-                          t[2] *= H.toDouble() / eh
-                          transforms[i] = t
+                      val px = decode(files[i], eW, eH)
+                      val luma = lumas[i]
+                      parFor(eW * eH) { j ->
+                          val p = px[j]
+                          luma[j] = 0.299f * ((p shr 16) and 255) +
+                                  0.587f * ((p shr 8) and 255) +
+                                  0.114f * (p and 255)
                       }
-                      onProgress(++done, total)
+                      pyrs[i] = buildEstPyr(luma, eW, eH)
+                      onProgress("Hizalamaya hazirlaniyor", i + 1, n)
                   }
-                  val bmp = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
-                  try {
-                      for (top in 0 until H step TILE_SIDE) {
-                          for (left in 0 until W step TILE_SIDE) {
-                              ensureActive()
-                              val right = min(left + TILE_SIDE, W)
-                              val bottom = min(top + TILE_SIDE, H)
-                              val tile = Rect(max(0, left - TILE_HALO), max(0, top - TILE_HALO),
-                                  min(W, right + TILE_HALO), min(H, bottom + TILE_HALO))
-                              val pixels = fuseTile(files, W, H, tile, transforms) {
-                                  onProgress(++done, total)
-                              }
-                              val offset = (top - tile.top) * tile.width() + left - tile.left
-                              bmp.setPixels(pixels, offset, tile.width(), left, top, right - left, bottom - top)
+
+                  // Referans kareye gore donusumler: [s, tx, ty] (eW x eH uzayinda)
+                  val transforms = Array(n) { doubleArrayOf(1.0, 0.0, 0.0) }
+
+                  // refIdx'den yakin plana dogru sirali hizalama (i -> i+1)
+                  for (i in refIdx - 1 downTo 0) {
+                      ensureActive()
+                      val step = estimate(pyrs[i + 1]!!, pyrs[i]!!, eW, eH)
+                      val nextT = transforms[i + 1]
+                      transforms[i] = composeTransform(nextT, step)
+                  }
+                  // refIdx'den uzak plana dogru sirali hizalama (i -> i-1)
+                  for (i in refIdx + 1 until n) {
+                      ensureActive()
+                      val step = estimate(pyrs[i - 1]!!, pyrs[i]!!, eW, eH)
+                      val prevT = transforms[i - 1]
+                      transforms[i] = composeTransform(prevT, step)
+                  }
+
+                  val sharpMaps = Array(n) { FloatArray(eW * eH) }
+                  val validMaps = Array(n) { FloatArray(eW * eH) }
+                  for (i in 0 until n) {
+                      ensureActive()
+                      val t = transforms[i]
+                      val warpedLuma = FloatArray(eW * eH)
+                      warpGray(lumas[i], eW, eH, t[0].toFloat(), t[1].toFloat(), t[2].toFloat(), warpedLuma, validMaps[i])
+                      sharpMaps[i] = denoisedSharpness(warpedLuma, eW, eH)
+                      onProgress("Keskinlik analizi", i + 1, n)
+                  }
+
+                  // Kareler arasi normalize agirliklar + yumusatma (halo onleyici)
+                  val normWeights = Array(n) { FloatArray(eW * eH) }
+                  parFor(eW * eH) { j ->
+                      var maxE = 0f
+                      for (i in 0 until n) {
+                          if (validMaps[i][j] > 0.5f) {
+                              val e = sharpMaps[i][j]
+                              if (e > maxE) maxE = e
                           }
                       }
-                      if (rotationDeg % 360 != 0) {
-                          val matrix = Matrix().apply { postRotate(rotationDeg.toFloat()) }
-                          val rotated = Bitmap.createBitmap(bmp, 0, 0, W, H, matrix, true)
-                          if (rotated !== bmp) bmp.recycle()
-                          rotated
-                      } else bmp
-                  } catch (e: Throwable) {
-                      bmp.recycle()
-                      throw e
+                      val floor = max(1.1f, maxE * 0.28f)
+                      var sumW = 0f
+                      for (i in 0 until n) {
+                          val v = validMaps[i][j]
+                          val e = sharpMaps[i][j]
+                          val above = max(0f, e - floor)
+                          val w = if (v > 0.5f && above > 0f) above.pow(4) else 0f
+                          normWeights[i][j] = w
+                          sumW += w
+                      }
+                      if (sumW > 1e-12f) {
+                          val inv = 1f / sumW
+                          for (i in 0 until n) normWeights[i][j] *= inv
+                      } else {
+                          var sumV = 0f
+                          for (i in 0 until n) sumV += validMaps[i][j]
+                          if (sumV > 0f) {
+                              val invV = 1f / sumV
+                              for (i in 0 until n) normWeights[i][j] = validMaps[i][j] * invV
+                          } else {
+                              normWeights[refIdx][j] = 1f
+                          }
+                      }
                   }
-              }
 
-              private suspend fun fuseTile(
-                  files: List<File>, fullW: Int, fullH: Int, tile: Rect,
-                  transforms: Array<DoubleArray>, onFrame: () -> Unit
-              ): IntArray {
-                  val W = tile.width()
-                  val H = tile.height()
+                  for (i in 0 until n) {
+                      val sm1 = convSep(normWeights[i], eW, eH, GAUSS5)
+                      normWeights[i] = convSep(sm1, eW, eH, GAUSS5)
+                  }
+
+                  // 2. ASAMA: Tam cozunurlukte 6 katmanli Laplacian Piramit birlestirme
                   val sizes = ArrayList<IntArray>()
                   var lw = W
                   var lh = H
@@ -257,19 +290,19 @@ jobs:
                   val dg = FloatArray(W * H)
                   val db = FloatArray(W * H)
                   val valid = FloatArray(W * H)
-                  val yBuf = FloatArray(W * H)
                   val chans = arrayOf(dr, dg, db)
+                  val ratioToWork = W.toFloat() / eW.toFloat()
 
-                  for (i in files.indices) {
-                      coroutineContext.ensureActive()
-                      warpRegion(files[i], fullW, fullH, tile, transforms[i], dr, dg, db, valid)
+                  for (i in 0 until n) {
+                      ensureActive()
+                      val px = decode(files[i], W, H)
+                      val t = transforms[i]
+                      val s = t[0].toFloat()
+                      val tx = t[1].toFloat() * ratioToWork
+                      val ty = t[2].toFloat() * ratioToWork
+                      warpRgb(px, W, H, s, tx, ty, dr, dg, db, valid)
 
-                      parFor(W * H) { j -> yBuf[j] = 0.299f * dr[j] + 0.587f * dg[j] + 0.114f * db[j] }
-                      val wgt = sharpness(yBuf, W, H)
-                      parFor(W * H) { j ->
-                          val e = wgt[j]
-                          wgt[j] = (e * e * e + 1e-6f) * valid[j]
-                      }
+                      val wgt = upsampleBilinear(normWeights[i], eW, eH, W, H, valid)
 
                       val wp = ArrayList<Img>(lv)
                       var wc = Img(W, H, wgt)
@@ -300,7 +333,7 @@ jobs:
                           val gd = g.d
                           parFor(nk.size) { j -> nk[j] += wk[j] * gd[j] }
                       }
-                      onFrame()
+                      onProgress("Piramit birlestirme", i + 1, n)
                   }
 
                   val out = Array(3) { c ->
@@ -326,7 +359,23 @@ jobs:
                       val b = out[2][i].roundToInt().coerceIn(0, 255)
                       argb[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                   }
-                  return argb
+                  val bmp = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
+                  bmp.setPixels(argb, 0, W, 0, 0, W, H)
+                  if (rotationDeg % 360 != 0) {
+                      val m = Matrix().apply { postRotate(rotationDeg.toFloat()) }
+                      val rotated = Bitmap.createBitmap(bmp, 0, 0, W, H, m, true)
+                      bmp.recycle()
+                      rotated
+                  } else {
+                      bmp
+                  }
+              }
+
+              private fun composeTransform(base: DoubleArray, step: DoubleArray): DoubleArray {
+                  val s = step[0] * base[0]
+                  val tx = step[0] * base[1] + step[1]
+                  val ty = step[0] * base[2] + step[2]
+                  return doubleArrayOf(s, tx, ty)
               }
 
               private fun decode(file: File, outW: Int, outH: Int): IntArray {
@@ -434,44 +483,65 @@ jobs:
                   return out
               }
 
-              private fun sharpness(y: FloatArray, w: Int, h: Int): FloatArray {
-                  val s = convSep(y, w, h, BLUR3)
+              private fun upsampleBilinear(
+                  src: FloatArray, sw: Int, sh: Int, dw: Int, dh: Int, valid: FloatArray
+              ): FloatArray {
+                  val out = FloatArray(dw * dh)
+                  val sxRatio = (sw - 1f) / max(1, dw - 1)
+                  val syRatio = (sh - 1f) / max(1, dh - 1)
+                  parFor(dh) { y ->
+                      val fy = y * syRatio
+                      val y0 = min(fy.toInt(), sh - 2)
+                      val ty = fy - y0
+                      val row0 = y0 * sw
+                      val row1 = (y0 + 1) * sw
+                      val dstRow = y * dw
+                      for (x in 0 until dw) {
+                          val fx = x * sxRatio
+                          val x0 = min(fx.toInt(), sw - 2)
+                          val tx = fx - x0
+                          val a = src[row0 + x0]
+                          val b = src[row0 + x0 + 1]
+                          val c = src[row1 + x0]
+                          val d = src[row1 + x0 + 1]
+                          val v = (a * (1f - tx) + b * tx) * (1f - ty) + (c * (1f - tx) + d * tx) * ty
+                          out[dstRow + x] = v * valid[dstRow + x] + 1e-6f
+                      }
+                  }
+                  return out
+              }
+
+              private fun denoisedSharpness(y: FloatArray, w: Int, h: Int): FloatArray {
+                  val s1 = convSep(y, w, h, GAUSS5)
+                  val s = convSep(s1, w, h, GAUSS5)
                   val e = FloatArray(w * h)
                   parFor(h) { yy ->
+                      val row = yy * w
+                      val u1 = max(yy - 1, 0) * w
+                      val d1 = min(yy + 1, h - 1) * w
+                      val u2 = max(yy - 2, 0) * w
+                      val d2 = min(yy + 2, h - 1) * w
                       for (x in 0 until w) {
-                          val c = s[yy * w + x]
-                          val l = s[yy * w + max(x - 1, 0)]
-                          val r = s[yy * w + min(x + 1, w - 1)]
-                          val u = s[max(yy - 1, 0) * w + x]
-                          val d = s[min(yy + 1, h - 1) * w + x]
-                          e[yy * w + x] = abs(2f * c - l - r) + abs(2f * c - u - d)
+                          val c = s[row + x]
+                          val ml1 = abs(2f * c - s[row + max(x - 1, 0)] - s[row + min(x + 1, w - 1)]) +
+                                  abs(2f * c - s[u1 + x] - s[d1 + x])
+                          val ml2 = abs(2f * c - s[row + max(x - 2, 0)] - s[row + min(x + 2, w - 1)]) +
+                                  abs(2f * c - s[u2 + x] - s[d2 + x])
+                          e[row + x] = ml1 + 0.75f * ml2
                       }
                   }
                   return convSep(e, w, h, BOX7)
               }
 
-              private fun buildEstPyr(px: IntArray, W: Int, H: Int): EstPyr {
-                  val luma = FloatArray(W * H)
-                  parFor(H) { y ->
-                      for (x in 0 until W) {
-                          val p = px[y * W + x]
-                          luma[y * W + x] = 0.299f * ((p shr 16) and 255) +
-                                  0.587f * ((p shr 8) and 255) + 0.114f * (p and 255)
-                      }
-                  }
-                  var cur = Img(W, H, luma)
-                  var k = 0
-                  while (max(cur.w, cur.h) > EST_MAX_SIDE) {
-                      cur = reduce(cur)
-                      k++
-                  }
+              private fun buildEstPyr(luma: FloatArray, W: Int, H: Int): EstPyr {
+                  var cur = Img(W, H, convSep(luma, W, H, GAUSS5))
                   val levels = ArrayList<Img>()
-                  levels.add(Img(cur.w, cur.h, convSep(cur.d, cur.w, cur.h, BLUR3)))
-                  while (max(cur.w, cur.h) > 160) {
+                  levels.add(cur)
+                  while (max(cur.w, cur.h) > 120) {
                       cur = reduce(cur)
-                      levels.add(Img(cur.w, cur.h, convSep(cur.d, cur.w, cur.h, BLUR3)))
+                      levels.add(Img(cur.w, cur.h, convSep(cur.d, cur.w, cur.h, GAUSS5)))
                   }
-                  return EstPyr(k, levels)
+                  return EstPyr(levels)
               }
 
               private fun bilin(a: FloatArray, i0: Int, w: Int, fx: Float, fy: Float): Float =
@@ -510,8 +580,7 @@ jobs:
                   val n = min(ref.levels.size, frm.levels.size)
                   for (j in n - 1 downTo 0) {
                       if (j < n - 1) { tx *= 2.0; ty *= 2.0 }
-                      val k = ref.k0 + j
-                      val f = (1 shl k).toDouble()
+                      val f = (1 shl j).toDouble()
                       val cx = (W - 1) / (2.0 * f)
                       val cy = (H - 1) / (2.0 * f)
                       val R = ref.levels[j]
@@ -527,8 +596,8 @@ jobs:
                               gy[i] = (F.d[i + w] - F.d[i - w]) * 0.5f
                           }
                       }
-                      val iters = if (j == 0) 8 else 14
-                      val st = if (w * h > 400_000) 2 else 1
+                      val iters = if (j == 0) 10 else 16
+                      val st = if (w * h > 450_000) 2 else 1
                       for (iter in 0 until iters) {
                           val hh = DoubleArray(6)
                           val bb = DoubleArray(3)
@@ -560,69 +629,67 @@ jobs:
                           hh[0] *= 1.0005; hh[3] *= 1.0005; hh[5] *= 1.0005
                           val d = solve3(hh, bb) ?: break
                           s += d[0]; tx += d[1]; ty += d[2]
-                          s = s.coerceIn(0.90, 1.10)
-                          tx = tx.coerceIn(-0.15 * w, 0.15 * w)
-                          ty = ty.coerceIn(-0.15 * h, 0.15 * h)
+                          s = s.coerceIn(0.82, 1.22)
+                          tx = tx.coerceIn(-0.20 * w, 0.20 * w)
+                          ty = ty.coerceIn(-0.20 * h, 0.20 * h)
                           if (abs(d[0]) < 2e-6 && abs(d[1]) < 2e-3 && abs(d[2]) < 2e-3) break
                       }
                   }
-                  val scale = (1 shl ref.k0).toDouble()
-                  return doubleArrayOf(s, tx * scale, ty * scale)
+                  return doubleArrayOf(s, tx, ty)
               }
 
-              private fun warpRegion(
-                  file: File, fullW: Int, fullH: Int, tile: Rect, transform: DoubleArray,
-                  dr: FloatArray, dg: FloatArray, db: FloatArray, valid: FloatArray
+              private fun warpGray(
+                  src: FloatArray, W: Int, H: Int, s: Float, tx: Float, ty: Float,
+                  dst: FloatArray, valid: FloatArray
               ) {
-                  val W = tile.width()
-                  val H = tile.height()
-                  val s = transform[0].toFloat()
-                  val tx = transform[1].toFloat()
-                  val ty = transform[2].toFloat()
-                  val cx = (fullW - 1) / 2f
-                  val cy = (fullH - 1) / 2f
-                  fun mapX(x: Int) = (cx + s * (x - cx) + tx).coerceIn(0f, fullW - 1f)
-                  fun mapY(y: Int) = (cy + s * (y - cy) + ty).coerceIn(0f, fullH - 1f)
-                  val region = Rect(
-                      max(0, mapX(tile.left).toInt() - 1),
-                      max(0, mapY(tile.top).toInt() - 1),
-                      min(fullW, mapX(tile.right - 1).toInt() + 3),
-                      min(fullH, mapY(tile.bottom - 1).toInt() + 3)
-                  )
-                  @Suppress("DEPRECATION")
-                  val decoder = BitmapRegionDecoder.newInstance(file.path, false)
-                      ?: throw IllegalStateException("JPEG bolgesi acilamadi")
-                  val src: IntArray
-                  try {
-                      val bitmap = decoder.decodeRegion(region, BitmapFactory.Options().apply {
-                          inPreferredConfig = Bitmap.Config.ARGB_8888
-                      }) ?: throw IllegalStateException("JPEG bolgesi cozulemedi")
-                      try {
-                          src = IntArray(region.width() * region.height())
-                          bitmap.getPixels(src, 0, region.width(), 0, 0, region.width(), region.height())
-                      } finally { bitmap.recycle() }
-                  } finally { decoder.recycle() }
-                  val stride = region.width()
+                  val cx = (W - 1) / 2f
+                  val cy = (H - 1) / 2f
                   parFor(H) { y ->
                       for (x in 0 until W) {
-                          var qx = cx + s * (x + tile.left - cx) + tx
-                          var qy = cy + s * (y + tile.top - cy) + ty
+                          var qx = cx + s * (x - cx) + tx
+                          var qy = cy + s * (y - cy) + ty
                           var v = 1f
-                          if (qx < 0f || qy < 0f || qx > fullW - 1f || qy > fullH - 1f) {
+                          if (qx < 0f || qy < 0f || qx > W - 1f || qy > H - 1f) {
                               v = 0f
-                              qx = qx.coerceIn(0f, fullW - 1f)
-                              qy = qy.coerceIn(0f, fullH - 1f)
+                              qx = qx.coerceIn(0f, W - 1f)
+                              qy = qy.coerceIn(0f, H - 1f)
                           }
-                          qx -= region.left
-                          qy -= region.top
-                          val x0 = min(qx.toInt(), region.width() - 2)
-                          val y0 = min(qy.toInt(), region.height() - 2)
+                          val x0 = min(qx.toInt(), W - 2)
+                          val y0 = min(qy.toInt(), H - 2)
                           val fx = qx - x0
                           val fy = qy - y0
-                          val p00 = src[y0 * stride + x0]
-                          val p01 = src[y0 * stride + x0 + 1]
-                          val p10 = src[(y0 + 1) * stride + x0]
-                          val p11 = src[(y0 + 1) * stride + x0 + 1]
+                          val i0 = y0 * W + x0
+                          val i = y * W + x
+                          dst[i] = bilin(src, i0, W, fx, fy)
+                          valid[i] = v
+                      }
+                  }
+              }
+
+              private fun warpRgb(
+                  src: IntArray, W: Int, H: Int, s: Float, tx: Float, ty: Float,
+                  dr: FloatArray, dg: FloatArray, db: FloatArray, valid: FloatArray
+              ) {
+                  val cx = (W - 1) / 2f
+                  val cy = (H - 1) / 2f
+                  parFor(H) { y ->
+                      for (x in 0 until W) {
+                          var qx = cx + s * (x - cx) + tx
+                          var qy = cy + s * (y - cy) + ty
+                          var v = 1f
+                          if (qx < 0f || qy < 0f || qx > W - 1f || qy > H - 1f) {
+                              v = 0f
+                              qx = qx.coerceIn(0f, W - 1f)
+                              qy = qy.coerceIn(0f, H - 1f)
+                          }
+                          val x0 = min(qx.toInt(), W - 2)
+                          val y0 = min(qy.toInt(), H - 2)
+                          val fx = qx - x0
+                          val fy = qy - y0
+                          val p00 = src[y0 * W + x0]
+                          val p01 = src[y0 * W + x0 + 1]
+                          val p10 = src[(y0 + 1) * W + x0]
+                          val p11 = src[(y0 + 1) * W + x0 + 1]
                           val w00 = (1 - fx) * (1 - fy)
                           val w01 = fx * (1 - fy)
                           val w10 = (1 - fx) * fy
@@ -704,9 +771,10 @@ jobs:
           class MainActivity : Activity() {
 
               companion object {
-                  const val FAR_DIOPTER = 0.15f
-                  const val GAMMA = 0.85f
-                  const val SETTLE_MS = 140L
+                  const val FAR_DIOPTER = 0.12f
+                  // > 1.0: yakin planda cok sik, uzak planda seyrek alan derinligi adimlari
+                  const val GAMMA = 2.2f
+                  const val SETTLE_MS = 160L
                   const val OUT_DIR = "Pictures/S23Ultra_FocusStack"
               }
 
@@ -715,8 +783,7 @@ jobs:
                   val openId: String,
                   val physicalId: String?,
                   val chars: CameraCharacteristics,
-                  val minFocus: Float,
-                  val focalMm: Float
+                  val minFocus: Float
               )
 
               private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -724,6 +791,7 @@ jobs:
               private lateinit var textureView: TextureView
               private lateinit var statusView: TextView
               private lateinit var countView: TextView
+              private lateinit var nearView: TextView
               private lateinit var btn06: Button
               private lateinit var btn1: Button
               private lateinit var shutter: Button
@@ -732,7 +800,8 @@ jobs:
 
               private val lenses = LinkedHashMap<String, Lens>()
               private var selected = "1x"
-              private var frameCount = 12
+              private var frameCount = 16
+              private var nearRatio = 0.90f
 
               private var camera: CameraDevice? = null
               private var session: CameraCaptureSession? = null
@@ -852,16 +921,17 @@ jobs:
 
                   val panel = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
-                      setPadding(dp(16), dp(12), dp(16), dp(24))
+                      setPadding(dp(16), dp(10), dp(16), dp(22))
                       setBackgroundColor(0xCC000000.toInt())
                   }
+
                   countView = TextView(this).apply {
                       setTextColor(Color.WHITE)
-                      textSize = 15f
+                      textSize = 14f
                       text = "Odak Basamak Sayisi: $frameCount kare"
                   }
-                  val seek = SeekBar(this).apply {
-                      max = 20
+                  val seekCount = SeekBar(this).apply {
+                      max = 25 // 5..30
                       progress = frameCount - 5
                       setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                           override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
@@ -872,6 +942,25 @@ jobs:
                           override fun onStopTrackingTouch(sb: SeekBar?) {}
                       })
                   }
+
+                  nearView = TextView(this).apply {
+                      setTextColor(Color.WHITE)
+                      textSize = 14f
+                      text = "Yakin Odak Baslangici: %${(nearRatio * 100).toInt()}"
+                  }
+                  val seekNear = SeekBar(this).apply {
+                      max = 80 // %20 .. %100
+                      progress = 70 // %90
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                              nearRatio = (p + 20) / 100f
+                              updateNearLabel()
+                          }
+                          override fun onStartTrackingTouch(sb: SeekBar?) {}
+                          override fun onStopTrackingTouch(sb: SeekBar?) {}
+                      })
+                  }
+
                   btn06 = Button(this).apply { text = "0.6x (Makro)"; setOnClickListener { selectLens("0.6x") } }
                   btn1 = Button(this).apply { text = "1x (Ana)"; setOnClickListener { selectLens("1x") } }
                   shutter = Button(this).apply { text = "BASLAT"; setOnClickListener { onShutter() } }
@@ -879,13 +968,16 @@ jobs:
                   val row = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER
+                      setPadding(0, dp(6), 0, 0)
                   }
                   row.addView(btn06, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                   row.addView(shutter, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.3f))
                   row.addView(btn1, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
                   panel.addView(countView)
-                  panel.addView(seek)
+                  panel.addView(seekCount)
+                  panel.addView(nearView)
+                  panel.addView(seekNear)
                   panel.addView(row)
                   root.addView(
                       panel,
@@ -896,6 +988,15 @@ jobs:
                       )
                   )
                   setContentView(root)
+              }
+
+              private fun updateNearLabel() {
+                  val lens = lenses[selected]
+                  val distInfo = if (lens != null && lens.minFocus > 0f) {
+                      val dpt = FAR_DIOPTER + (lens.minFocus - FAR_DIOPTER) * nearRatio
+                      " (~${(100f / dpt).toInt()} cm)"
+                  } else ""
+                  nearView.text = "Yakin Odak Baslangici: %${(nearRatio * 100).toInt()}$distInfo"
               }
 
               private fun status(msg: String) {
@@ -911,6 +1012,7 @@ jobs:
                   btn1.isEnabled = lenses.containsKey("1x")
                   btn06.alpha = if (selected == "0.6x") 1f else 0.5f
                   btn1.alpha = if (selected == "1x") 1f else 0.5f
+                  updateNearLabel()
               }
 
               private fun selectLens(key: String) {
@@ -938,12 +1040,11 @@ jobs:
                           eq in 18.5f..35f || openId == "0" -> "1x"
                           else -> return
                       }
-                      candidates.add(Lens(label, openId, physId, ch, minF, f))
+                      candidates.add(Lens(label, openId, physId, ch, minF))
                   }
 
                   val allIds = LinkedHashSet<String>()
                   try { allIds.addAll(cm.cameraIdList.toList()) } catch (_: Exception) {}
-                  // Samsung S23 Ultra dogrudan acilabilen kamera ID'leri (0=1x, 2=0.6x)
                   for (extra in listOf("0", "2")) allIds.add(extra)
 
                   for (id in allIds) {
@@ -1005,9 +1106,7 @@ jobs:
                           val jpg = jpgAll
                               .filter { it.width * 3 == it.height * 4 && it.width * it.height in 8_000_000..13_000_000 }
                               .maxByOrNull { it.width * it.height }
-                              ?: jpgAll.filter { it.width.toLong() * it.height <= 13_000_000L }
-                                  .maxByOrNull { it.width * it.height }
-                              ?: throw IllegalStateException("13 MP veya alti JPEG boyutu bulunamadi")
+                              ?: jpgAll.maxByOrNull { it.width * it.height }!!
 
                           val dev = openDevice(lens.openId)
                           camera = dev
@@ -1026,8 +1125,9 @@ jobs:
                           val cmDist = if (lens.minFocus > 0f) " (~${(100f / lens.minFocus).toInt()} cm)" else ""
                           status(
                               "${lens.label} (ID:${lens.openId}${lens.physicalId?.let { "/$it" } ?: ""}) • " +
-                                  "Min Odak: ${"%.1f".format(lens.minFocus)} dpt$cmDist • ${jpg.width}x${jpg.height}"
+                                  "Min Odak: ${"%.1f".format(lens.minFocus)} dpt$cmDist • Telefonu sabit tutun"
                           )
+                          updateNearLabel()
                       } catch (e: CancellationException) {
                           throw e
                       } catch (e: Exception) {
@@ -1061,9 +1161,7 @@ jobs:
                   if (physicalId != null) {
                       try {
                           return createSession(dev, surfaces, physicalId)
-                      } catch (_: Exception) {
-                          // Fiziksel kamera ID oturumu reddedilirse mantiksal kamera uzerinden devam et
-                      }
+                      } catch (_: Exception) {}
                   }
                   return createSession(dev, surfaces, null)
               }
@@ -1136,11 +1234,16 @@ jobs:
                       CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
                       CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
                   )
+                  b.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST)
+                  b.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
               }
 
-              private fun focusSteps(n: Int, near: Float): FloatArray = FloatArray(n) { i ->
-                  val t = i / (n - 1f)
-                  FAR_DIOPTER + (near - FAR_DIOPTER) * (1f - t).pow(GAMMA)
+              private fun focusSteps(n: Int, maxNear: Float): FloatArray {
+                  val startNear = FAR_DIOPTER + (maxNear - FAR_DIOPTER) * nearRatio
+                  return FloatArray(n) { i ->
+                      val t = i / (n - 1f)
+                      FAR_DIOPTER + (startNear - FAR_DIOPTER) * (1f - t).pow(GAMMA)
+                  }
               }
 
               private fun onShutter() {
@@ -1161,10 +1264,9 @@ jobs:
                           runBurst(lens, files)
                           try { session?.setRepeatingRequest(previewBuilder().build(), repeatCb, bg) } catch (_: Exception) {}
 
-                          status("Tam cozunurlukte hizalaniyor ve parcalar birlestiriliyor...")
                           val rotation = lens.chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-                          val bmp = FocusStackProcessor.stack(files, rotation) { d, t ->
-                              status("Tam cozunurluk: ${d * 100 / t}%")
+                          val bmp = FocusStackProcessor.stack(files, rotation) { stage, d, t ->
+                              status("$stage: $d / $t")
                           }
                           status("Galeriye kaydediliyor...")
                           val name = withContext(Dispatchers.IO) { saveToGallery(bmp) }
@@ -1177,8 +1279,6 @@ jobs:
                           status("Hata: ${e.message}")
                           toast("Hata: ${e.message}")
                       } finally {
-                          pending = null
-                          try { session?.setRepeatingRequest(previewBuilder().build(), repeatCb, bg) } catch (_: Exception) {}
                           files.forEach { it.delete() }
                           busy = false
                           shutter.isEnabled = true
@@ -1194,7 +1294,7 @@ jobs:
                   val n = frameCount
                   val steps = focusSteps(n, lens.minFocus)
 
-                  status("AE/AWB Pozlama ve Renk kilitleniyor...")
+                  status("Pozlama ve beyaz dengesi kilitleniyor...")
                   var waited = 0
                   while (waited < 2000) {
                       val st = lastResult?.get(CaptureResult.CONTROL_AE_STATE)
@@ -1205,25 +1305,18 @@ jobs:
                   val lockB = previewBuilder()
                   applyBurst(lockB, steps[0])
                   sess.setRepeatingRequest(lockB.build(), repeatCb, bg)
-                  delay(350)
+                  delay(400)
 
                   for (i in 0 until n) {
                       status("Cekiliyor ${i + 1}/$n (Odak: ${"%.2f".format(steps[i])} dpt)")
                       val rb = previewBuilder()
                       applyBurst(rb, steps[i])
-                      val focusTag = Any()
-                      rb.setTag(focusTag)
                       sess.setRepeatingRequest(rb.build(), repeatCb, bg)
 
                       delay(SETTLE_MS)
-                      // Never accept a stationary result from the previous focus command.
-                      withTimeout(2_000) {
-                          while (true) {
-                              val result = lastResult
-                              if (result?.request?.tag === focusTag &&
-                                  result.get(CaptureResult.LENS_STATE) != CaptureResult.LENS_STATE_MOVING) break
-                              delay(25)
-                          }
+                      var w = 0
+                      while (w < 400 && lastResult?.get(CaptureResult.LENS_STATE) == CaptureResult.LENS_STATE_MOVING) {
+                          delay(25); w += 25
                       }
 
                       val cb = dev.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
