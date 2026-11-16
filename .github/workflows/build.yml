@@ -1,4 +1,4 @@
-name: Build APK
+name: Build S23U FocusStack APK
 
 on:
   push:
@@ -12,23 +12,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: JDK 17
+      - name: JDK 17 Kurulumu
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Android SDK lisanslari
+      - name: Android SDK Lisanslarini Onayla
         run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
-      - name: Gradle 8.7
+      - name: Gradle 8.7 Kurulumu
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.7'
 
-      - name: Proje dosyalarini olustur
+      - name: Tum Proje ve Kotlin Kaynak Dosyalarini Olustur
         run: |
-          mkdir -p app/src/main
+          # Eski yanlis yerlesimli dosyalari temizle ve dogru agaci kur
+          rm -rf app build settings.gradle.kts build.gradle.kts gradle.properties
+          mkdir -p app/src/main/java/com/s23ultra/focusstack
           echo "sdk.dir=$ANDROID_HOME" > local.properties
 
           cat > settings.gradle.kts << 'EOF'
@@ -58,7 +60,7 @@ jobs:
           EOF
 
           cat > gradle.properties << 'EOF'
-          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
           android.useAndroidX=true
           android.nonTransitiveRClass=true
           kotlin.code.style=official
@@ -78,8 +80,8 @@ jobs:
                   applicationId = "com.s23ultra.focusstack"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 3
+                  versionName = "2.1-S23U-FullRes"
               }
 
               buildTypes {
@@ -108,14 +110,16 @@ jobs:
 
               <uses-permission android:name="android.permission.CAMERA" />
               <uses-feature android:name="android.hardware.camera" android:required="true" />
+              <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
               <application
                   android:allowBackup="false"
                   android:label="S23U Focus Stack"
                   android:largeHeap="true"
-                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  android:hardwareAccelerated="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
                   <activity
-                      android:name=".MainActivity"
+                      android:name="com.s23ultra.focusstack.MainActivity"
                       android:configChanges="orientation|screenSize|keyboardHidden"
                       android:exported="true"
                       android:screenOrientation="portrait">
@@ -128,11 +132,1138 @@ jobs:
           </manifest>
           EOF
 
-      - name: APK derle
+          cat > app/src/main/java/com/s23ultra/focusstack/FocusStackProcessor.kt << 'EOF'
+          package com.s23ultra.focusstack
+
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Matrix
+          import android.graphics.BitmapRegionDecoder
+          import android.graphics.Rect
+          import kotlin.coroutines.coroutineContext
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.ensureActive
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.util.stream.IntStream
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.roundToInt
+
+          object FocusStackProcessor {
+
+              // 32-pixel grid preserves the phase of all six pyramid levels.
+              private const val TILE_SIDE = 512
+              private const val TILE_HALO = 192
+              private const val PYRAMID_LEVELS = 6
+              private const val EST_MAX_SIDE = 1024
+              private val BLUR3 = floatArrayOf(0.25f, 0.5f, 0.25f)
+              private val BOX7 = FloatArray(7) { 1f / 7f }
+
+              private class Img(val w: Int, val h: Int, val d: FloatArray)
+              private class EstPyr(val k0: Int, val levels: List<Img>)
+
+              private inline fun parFor(n: Int, crossinline body: (Int) -> Unit) {
+                  IntStream.range(0, n).parallel().forEach { i -> body(i) }
+              }
+
+              suspend fun stack(
+                  files: List<File>,
+                  rotationDeg: Int,
+                  onProgress: (done: Int, total: Int) -> Unit
+              ): Bitmap = withContext(Dispatchers.Default) {
+                  require(files.size >= 2) { "En az 2 kare gerekli" }
+                  val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  BitmapFactory.decodeFile(files[0].path, bounds)
+                  val W = bounds.outWidth
+                  val H = bounds.outHeight
+                  require(W >= 64 && H >= 64 && W.toLong() * H <= 16_000_000L) {
+                      "Desteklenmeyen kaynak boyutu: ${W}x${H} (en fazla 16 MP)"
+                  }
+                  for (file in files) {
+                      BitmapFactory.decodeFile(file.path, bounds)
+                      require(bounds.outWidth == W && bounds.outHeight == H) { "Kare boyutlari farkli" }
+                  }
+                  // Estimate once at low resolution; fuse the original JPEG pixels without resizing.
+                  var factor = 1
+                  while (max(W, H) / factor > EST_MAX_SIDE) factor *= 2
+                  val ew = max(64, W / factor)
+                  val eh = max(64, H / factor)
+                  val refIdx = files.size / 2
+                  val reference = buildEstPyr(decode(files[refIdx], ew, eh), ew, eh)
+                  val transforms = Array(files.size) { doubleArrayOf(1.0, 0.0, 0.0) }
+                  val tiles = ((W + TILE_SIDE - 1) / TILE_SIDE) * ((H + TILE_SIDE - 1) / TILE_SIDE)
+                  val total = files.size * (tiles + 1)
+                  var done = 0
+                  for (i in files.indices) {
+                      ensureActive()
+                      if (i != refIdx) {
+                          val t = estimate(reference, buildEstPyr(decode(files[i], ew, eh), ew, eh), ew, eh)
+                          t[1] *= W.toDouble() / ew
+                          t[2] *= H.toDouble() / eh
+                          transforms[i] = t
+                      }
+                      onProgress(++done, total)
+                  }
+                  val bmp = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
+                  try {
+                      for (top in 0 until H step TILE_SIDE) {
+                          for (left in 0 until W step TILE_SIDE) {
+                              ensureActive()
+                              val right = min(left + TILE_SIDE, W)
+                              val bottom = min(top + TILE_SIDE, H)
+                              val tile = Rect(max(0, left - TILE_HALO), max(0, top - TILE_HALO),
+                                  min(W, right + TILE_HALO), min(H, bottom + TILE_HALO))
+                              val pixels = fuseTile(files, W, H, tile, transforms) {
+                                  onProgress(++done, total)
+                              }
+                              val offset = (top - tile.top) * tile.width() + left - tile.left
+                              bmp.setPixels(pixels, offset, tile.width(), left, top, right - left, bottom - top)
+                          }
+                      }
+                      if (rotationDeg % 360 != 0) {
+                          val matrix = Matrix().apply { postRotate(rotationDeg.toFloat()) }
+                          val rotated = Bitmap.createBitmap(bmp, 0, 0, W, H, matrix, true)
+                          if (rotated !== bmp) bmp.recycle()
+                          rotated
+                      } else bmp
+                  } catch (e: Throwable) {
+                      bmp.recycle()
+                      throw e
+                  }
+              }
+
+              private suspend fun fuseTile(
+                  files: List<File>, fullW: Int, fullH: Int, tile: Rect,
+                  transforms: Array<DoubleArray>, onFrame: () -> Unit
+              ): IntArray {
+                  val W = tile.width()
+                  val H = tile.height()
+                  val sizes = ArrayList<IntArray>()
+                  var lw = W
+                  var lh = H
+                  sizes.add(intArrayOf(lw, lh))
+                  while (sizes.size < PYRAMID_LEVELS && min(lw, lh) >= 16) {
+                      lw = (lw + 1) / 2
+                      lh = (lh + 1) / 2
+                      sizes.add(intArrayOf(lw, lh))
+                  }
+                  val lv = sizes.size
+                  val num = Array(3) { Array(lv) { k -> FloatArray(sizes[k][0] * sizes[k][1]) } }
+                  val den = Array(lv) { k -> FloatArray(sizes[k][0] * sizes[k][1]) }
+
+                  val dr = FloatArray(W * H)
+                  val dg = FloatArray(W * H)
+                  val db = FloatArray(W * H)
+                  val valid = FloatArray(W * H)
+                  val yBuf = FloatArray(W * H)
+                  val chans = arrayOf(dr, dg, db)
+
+                  for (i in files.indices) {
+                      coroutineContext.ensureActive()
+                      warpRegion(files[i], fullW, fullH, tile, transforms[i], dr, dg, db, valid)
+
+                      parFor(W * H) { j -> yBuf[j] = 0.299f * dr[j] + 0.587f * dg[j] + 0.114f * db[j] }
+                      val wgt = sharpness(yBuf, W, H)
+                      parFor(W * H) { j ->
+                          val e = wgt[j]
+                          wgt[j] = (e * e * e + 1e-6f) * valid[j]
+                      }
+
+                      val wp = ArrayList<Img>(lv)
+                      var wc = Img(W, H, wgt)
+                      wp.add(wc)
+                      for (k in 1 until lv) {
+                          wc = reduce(wc)
+                          wp.add(wc)
+                      }
+                      for (k in 0 until lv) {
+                          val dk = den[k]
+                          val wk = wp[k].d
+                          parFor(dk.size) { j -> dk[j] += wk[j] }
+                      }
+
+                      for (c in 0 until 3) {
+                          var g = Img(W, H, chans[c])
+                          for (k in 0 until lv - 1) {
+                              val gn = reduce(g)
+                              val up = expandTo(gn, g.w, g.h)
+                              val nk = num[c][k]
+                              val wk = wp[k].d
+                              val gd = g.d
+                              parFor(nk.size) { j -> nk[j] += wk[j] * (gd[j] - up[j]) }
+                              g = gn
+                          }
+                          val nk = num[c][lv - 1]
+                          val wk = wp[lv - 1].d
+                          val gd = g.d
+                          parFor(nk.size) { j -> nk[j] += wk[j] * gd[j] }
+                      }
+                      onFrame()
+                  }
+
+                  val out = Array(3) { c ->
+                      for (k in 0 until lv) {
+                          val a = num[c][k]
+                          val d = den[k]
+                          parFor(a.size) { j -> a[j] /= max(d[j], 1e-9f) }
+                      }
+                      var cur = Img(sizes[lv - 1][0], sizes[lv - 1][1], num[c][lv - 1])
+                      for (k in lv - 2 downTo 0) {
+                          val up = expandTo(cur, sizes[k][0], sizes[k][1])
+                          val a = num[c][k]
+                          parFor(a.size) { j -> up[j] += a[j] }
+                          cur = Img(sizes[k][0], sizes[k][1], up)
+                      }
+                      cur.d
+                  }
+
+                  val argb = IntArray(W * H)
+                  parFor(W * H) { i ->
+                      val r = out[0][i].roundToInt().coerceIn(0, 255)
+                      val g = out[1][i].roundToInt().coerceIn(0, 255)
+                      val b = out[2][i].roundToInt().coerceIn(0, 255)
+                      argb[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                  }
+                  return argb
+              }
+
+              private fun decode(file: File, outW: Int, outH: Int): IntArray {
+                  val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  BitmapFactory.decodeFile(file.path, bo)
+                  var sample = 1
+                  while (bo.outWidth / (sample * 2) >= outW && bo.outHeight / (sample * 2) >= outH) sample *= 2
+                  val o = BitmapFactory.Options().apply {
+                      inSampleSize = sample
+                      inPreferredConfig = Bitmap.Config.ARGB_8888
+                  }
+                  val bm = BitmapFactory.decodeFile(file.path, o)
+                      ?: throw IllegalStateException("JPEG cozulemedi: ${file.name}")
+                  val scaled = if (bm.width == outW && bm.height == outH) bm
+                  else Bitmap.createScaledBitmap(bm, outW, outH, true)
+                  if (scaled !== bm) bm.recycle()
+                  val px = IntArray(outW * outH)
+                  scaled.getPixels(px, 0, outW, 0, 0, outW, outH)
+                  scaled.recycle()
+                  return px
+              }
+
+              private fun convSep(src: FloatArray, w: Int, h: Int, k: FloatArray): FloatArray {
+                  val r = k.size / 2
+                  val tmp = FloatArray(w * h)
+                  val out = FloatArray(w * h)
+                  parFor(h) { y ->
+                      val o = y * w
+                      for (x in 0 until w) {
+                          var s = 0f
+                          for (i in -r..r) {
+                              val xx = min(max(x + i, 0), w - 1)
+                              s += k[i + r] * src[o + xx]
+                          }
+                          tmp[o + x] = s
+                      }
+                  }
+                  parFor(h) { y ->
+                      for (x in 0 until w) {
+                          var s = 0f
+                          for (i in -r..r) {
+                              val yy = min(max(y + i, 0), h - 1)
+                              s += k[i + r] * tmp[yy * w + x]
+                          }
+                          out[y * w + x] = s
+                      }
+                  }
+                  return out
+              }
+
+              private fun reduce(img: Img): Img {
+                  val w = img.w
+                  val h = img.h
+                  val src = img.d
+                  val tmp = FloatArray(w * h)
+                  parFor(h) { y ->
+                      val o = y * w
+                      for (x in 0 until w) {
+                          val a = src[o + max(x - 2, 0)]
+                          val b = src[o + max(x - 1, 0)]
+                          val c = src[o + x]
+                          val d = src[o + min(x + 1, w - 1)]
+                          val e = src[o + min(x + 2, w - 1)]
+                          tmp[o + x] = (a + 4f * b + 6f * c + 4f * d + e) / 16f
+                      }
+                  }
+                  val nw = (w + 1) / 2
+                  val nh = (h + 1) / 2
+                  val out = FloatArray(nw * nh)
+                  parFor(nh) { j ->
+                      val y = j * 2
+                      val y0 = max(y - 2, 0) * w
+                      val y1 = max(y - 1, 0) * w
+                      val y2 = y * w
+                      val y3 = min(y + 1, h - 1) * w
+                      val y4 = min(y + 2, h - 1) * w
+                      for (i in 0 until nw) {
+                          val x = i * 2
+                          out[j * nw + i] =
+                              (tmp[y0 + x] + 4f * tmp[y1 + x] + 6f * tmp[y2 + x] + 4f * tmp[y3 + x] + tmp[y4 + x]) / 16f
+                      }
+                  }
+                  return Img(nw, nh, out)
+              }
+
+              private fun expandTo(s: Img, dw: Int, dh: Int): FloatArray {
+                  val out = FloatArray(dw * dh)
+                  parFor(dh) { y ->
+                      val fy = y * 0.5f
+                      val y0 = min(fy.toInt(), s.h - 1)
+                      val y1 = min(y0 + 1, s.h - 1)
+                      val ty = fy - y0
+                      for (x in 0 until dw) {
+                          val fx = x * 0.5f
+                          val x0 = min(fx.toInt(), s.w - 1)
+                          val x1 = min(x0 + 1, s.w - 1)
+                          val tx = fx - x0
+                          val a = s.d[y0 * s.w + x0]
+                          val b = s.d[y0 * s.w + x1]
+                          val c = s.d[y1 * s.w + x0]
+                          val d = s.d[y1 * s.w + x1]
+                          out[y * dw + x] = (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty
+                      }
+                  }
+                  return out
+              }
+
+              private fun sharpness(y: FloatArray, w: Int, h: Int): FloatArray {
+                  val s = convSep(y, w, h, BLUR3)
+                  val e = FloatArray(w * h)
+                  parFor(h) { yy ->
+                      for (x in 0 until w) {
+                          val c = s[yy * w + x]
+                          val l = s[yy * w + max(x - 1, 0)]
+                          val r = s[yy * w + min(x + 1, w - 1)]
+                          val u = s[max(yy - 1, 0) * w + x]
+                          val d = s[min(yy + 1, h - 1) * w + x]
+                          e[yy * w + x] = abs(2f * c - l - r) + abs(2f * c - u - d)
+                      }
+                  }
+                  return convSep(e, w, h, BOX7)
+              }
+
+              private fun buildEstPyr(px: IntArray, W: Int, H: Int): EstPyr {
+                  val luma = FloatArray(W * H)
+                  parFor(H) { y ->
+                      for (x in 0 until W) {
+                          val p = px[y * W + x]
+                          luma[y * W + x] = 0.299f * ((p shr 16) and 255) +
+                                  0.587f * ((p shr 8) and 255) + 0.114f * (p and 255)
+                      }
+                  }
+                  var cur = Img(W, H, luma)
+                  var k = 0
+                  while (max(cur.w, cur.h) > EST_MAX_SIDE) {
+                      cur = reduce(cur)
+                      k++
+                  }
+                  val levels = ArrayList<Img>()
+                  levels.add(Img(cur.w, cur.h, convSep(cur.d, cur.w, cur.h, BLUR3)))
+                  while (max(cur.w, cur.h) > 160) {
+                      cur = reduce(cur)
+                      levels.add(Img(cur.w, cur.h, convSep(cur.d, cur.w, cur.h, BLUR3)))
+                  }
+                  return EstPyr(k, levels)
+              }
+
+              private fun bilin(a: FloatArray, i0: Int, w: Int, fx: Float, fy: Float): Float =
+                  (a[i0] * (1 - fx) + a[i0 + 1] * fx) * (1 - fy) +
+                          (a[i0 + w] * (1 - fx) + a[i0 + w + 1] * fx) * fy
+
+              private fun solve3(h: DoubleArray, b: DoubleArray): DoubleArray? {
+                  val a = arrayOf(
+                      doubleArrayOf(h[0], h[1], h[2], b[0]),
+                      doubleArrayOf(h[1], h[3], h[4], b[1]),
+                      doubleArrayOf(h[2], h[4], h[5], b[2])
+                  )
+                  for (i in 0 until 3) {
+                      var p = i
+                      for (r in i + 1 until 3) if (abs(a[r][i]) > abs(a[p][i])) p = r
+                      if (abs(a[p][i]) < 1e-9) return null
+                      val t = a[i]; a[i] = a[p]; a[p] = t
+                      for (r in i + 1 until 3) {
+                          val f = a[r][i] / a[i][i]
+                          for (c in i until 4) a[r][c] -= f * a[i][c]
+                      }
+                  }
+                  val x = DoubleArray(3)
+                  for (i in 2 downTo 0) {
+                      var s = a[i][3]
+                      for (c in i + 1 until 3) s -= a[i][c] * x[c]
+                      x[i] = s / a[i][i]
+                  }
+                  return x
+              }
+
+              private fun estimate(ref: EstPyr, frm: EstPyr, W: Int, H: Int): DoubleArray {
+                  var s = 1.0
+                  var tx = 0.0
+                  var ty = 0.0
+                  val n = min(ref.levels.size, frm.levels.size)
+                  for (j in n - 1 downTo 0) {
+                      if (j < n - 1) { tx *= 2.0; ty *= 2.0 }
+                      val k = ref.k0 + j
+                      val f = (1 shl k).toDouble()
+                      val cx = (W - 1) / (2.0 * f)
+                      val cy = (H - 1) / (2.0 * f)
+                      val R = ref.levels[j]
+                      val F = frm.levels[j]
+                      val w = R.w
+                      val h = R.h
+                      val gx = FloatArray(w * h)
+                      val gy = FloatArray(w * h)
+                      for (y in 1 until h - 1) {
+                          for (x in 1 until w - 1) {
+                              val i = y * w + x
+                              gx[i] = (F.d[i + 1] - F.d[i - 1]) * 0.5f
+                              gy[i] = (F.d[i + w] - F.d[i - w]) * 0.5f
+                          }
+                      }
+                      val iters = if (j == 0) 8 else 14
+                      val st = if (w * h > 400_000) 2 else 1
+                      for (iter in 0 until iters) {
+                          val hh = DoubleArray(6)
+                          val bb = DoubleArray(3)
+                          var cnt = 0
+                          for (y in 2 until h - 2 step st) {
+                              val uy = y - cy
+                              for (x in 2 until w - 2 step st) {
+                                  val ux = x - cx
+                                  val qx = cx + s * ux + tx
+                                  val qy = cy + s * uy + ty
+                                  if (qx < 2.0 || qy < 2.0 || qx > w - 3.0 || qy > h - 3.0) continue
+                                  val x0 = qx.toInt()
+                                  val y0 = qy.toInt()
+                                  val fx = (qx - x0).toFloat()
+                                  val fy = (qy - y0).toFloat()
+                                  val i0 = y0 * w + x0
+                                  val fv = bilin(F.d, i0, w, fx, fy)
+                                  val gxv = bilin(gx, i0, w, fx, fy).toDouble()
+                                  val gyv = bilin(gy, i0, w, fx, fy).toDouble()
+                                  val r = (fv - R.d[y * w + x]).toDouble()
+                                  val j0 = gxv * ux + gyv * uy
+                                  hh[0] += j0 * j0; hh[1] += j0 * gxv; hh[2] += j0 * gyv
+                                  hh[3] += gxv * gxv; hh[4] += gxv * gyv; hh[5] += gyv * gyv
+                                  bb[0] -= j0 * r; bb[1] -= gxv * r; bb[2] -= gyv * r
+                                  cnt++
+                              }
+                          }
+                          if (cnt < 200) break
+                          hh[0] *= 1.0005; hh[3] *= 1.0005; hh[5] *= 1.0005
+                          val d = solve3(hh, bb) ?: break
+                          s += d[0]; tx += d[1]; ty += d[2]
+                          s = s.coerceIn(0.90, 1.10)
+                          tx = tx.coerceIn(-0.15 * w, 0.15 * w)
+                          ty = ty.coerceIn(-0.15 * h, 0.15 * h)
+                          if (abs(d[0]) < 2e-6 && abs(d[1]) < 2e-3 && abs(d[2]) < 2e-3) break
+                      }
+                  }
+                  val scale = (1 shl ref.k0).toDouble()
+                  return doubleArrayOf(s, tx * scale, ty * scale)
+              }
+
+              private fun warpRegion(
+                  file: File, fullW: Int, fullH: Int, tile: Rect, transform: DoubleArray,
+                  dr: FloatArray, dg: FloatArray, db: FloatArray, valid: FloatArray
+              ) {
+                  val W = tile.width()
+                  val H = tile.height()
+                  val s = transform[0].toFloat()
+                  val tx = transform[1].toFloat()
+                  val ty = transform[2].toFloat()
+                  val cx = (fullW - 1) / 2f
+                  val cy = (fullH - 1) / 2f
+                  fun mapX(x: Int) = (cx + s * (x - cx) + tx).coerceIn(0f, fullW - 1f)
+                  fun mapY(y: Int) = (cy + s * (y - cy) + ty).coerceIn(0f, fullH - 1f)
+                  val region = Rect(
+                      max(0, mapX(tile.left).toInt() - 1),
+                      max(0, mapY(tile.top).toInt() - 1),
+                      min(fullW, mapX(tile.right - 1).toInt() + 3),
+                      min(fullH, mapY(tile.bottom - 1).toInt() + 3)
+                  )
+                  @Suppress("DEPRECATION")
+                  val decoder = BitmapRegionDecoder.newInstance(file.path, false)
+                      ?: throw IllegalStateException("JPEG bolgesi acilamadi")
+                  val src: IntArray
+                  try {
+                      val bitmap = decoder.decodeRegion(region, BitmapFactory.Options().apply {
+                          inPreferredConfig = Bitmap.Config.ARGB_8888
+                      }) ?: throw IllegalStateException("JPEG bolgesi cozulemedi")
+                      try {
+                          src = IntArray(region.width() * region.height())
+                          bitmap.getPixels(src, 0, region.width(), 0, 0, region.width(), region.height())
+                      } finally { bitmap.recycle() }
+                  } finally { decoder.recycle() }
+                  val stride = region.width()
+                  parFor(H) { y ->
+                      for (x in 0 until W) {
+                          var qx = cx + s * (x + tile.left - cx) + tx
+                          var qy = cy + s * (y + tile.top - cy) + ty
+                          var v = 1f
+                          if (qx < 0f || qy < 0f || qx > fullW - 1f || qy > fullH - 1f) {
+                              v = 0f
+                              qx = qx.coerceIn(0f, fullW - 1f)
+                              qy = qy.coerceIn(0f, fullH - 1f)
+                          }
+                          qx -= region.left
+                          qy -= region.top
+                          val x0 = min(qx.toInt(), region.width() - 2)
+                          val y0 = min(qy.toInt(), region.height() - 2)
+                          val fx = qx - x0
+                          val fy = qy - y0
+                          val p00 = src[y0 * stride + x0]
+                          val p01 = src[y0 * stride + x0 + 1]
+                          val p10 = src[(y0 + 1) * stride + x0]
+                          val p11 = src[(y0 + 1) * stride + x0 + 1]
+                          val w00 = (1 - fx) * (1 - fy)
+                          val w01 = fx * (1 - fy)
+                          val w10 = (1 - fx) * fy
+                          val w11 = fx * fy
+                          val i = y * W + x
+                          dr[i] = w00 * ((p00 shr 16) and 255) + w01 * ((p01 shr 16) and 255) +
+                                  w10 * ((p10 shr 16) and 255) + w11 * ((p11 shr 16) and 255)
+                          dg[i] = w00 * ((p00 shr 8) and 255) + w01 * ((p01 shr 8) and 255) +
+                                  w10 * ((p10 shr 8) and 255) + w11 * ((p11 shr 8) and 255)
+                          db[i] = w00 * (p00 and 255) + w01 * (p01 and 255) +
+                                  w10 * (p10 and 255) + w11 * (p11 and 255)
+                          valid[i] = v
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/s23ultra/focusstack/MainActivity.kt << 'EOF'
+          package com.s23ultra.focusstack
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.ContentValues
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.graphics.ImageFormat
+          import android.graphics.SurfaceTexture
+          import android.hardware.camera2.CameraCaptureSession
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraDevice
+          import android.hardware.camera2.CameraManager
+          import android.hardware.camera2.CaptureRequest
+          import android.hardware.camera2.CaptureResult
+          import android.hardware.camera2.TotalCaptureResult
+          import android.hardware.camera2.params.OutputConfiguration
+          import android.hardware.camera2.params.SessionConfiguration
+          import android.media.ImageReader
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.provider.MediaStore
+          import android.util.Size
+          import android.view.Gravity
+          import android.view.Surface
+          import android.view.TextureView
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlinx.coroutines.CancellationException
+          import kotlinx.coroutines.CompletableDeferred
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.cancel
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.suspendCancellableCoroutine
+          import kotlinx.coroutines.withContext
+          import kotlinx.coroutines.withTimeout
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import kotlin.coroutines.resume
+          import kotlin.coroutines.resumeWithException
+          import kotlin.math.hypot
+          import kotlin.math.pow
+
+          class MainActivity : Activity() {
+
+              companion object {
+                  const val FAR_DIOPTER = 0.15f
+                  const val GAMMA = 0.85f
+                  const val SETTLE_MS = 140L
+                  const val OUT_DIR = "Pictures/S23Ultra_FocusStack"
+              }
+
+              private class Lens(
+                  val label: String,
+                  val openId: String,
+                  val physicalId: String?,
+                  val chars: CameraCharacteristics,
+                  val minFocus: Float,
+                  val focalMm: Float
+              )
+
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+              private lateinit var cm: CameraManager
+              private lateinit var textureView: TextureView
+              private lateinit var statusView: TextView
+              private lateinit var countView: TextView
+              private lateinit var btn06: Button
+              private lateinit var btn1: Button
+              private lateinit var shutter: Button
+              private lateinit var bgThread: HandlerThread
+              private lateinit var bg: Handler
+
+              private val lenses = LinkedHashMap<String, Lens>()
+              private var selected = "1x"
+              private var frameCount = 12
+
+              private var camera: CameraDevice? = null
+              private var session: CameraCaptureSession? = null
+              private var reader: ImageReader? = null
+              private var previewSurface: Surface? = null
+              private var camJob: Job? = null
+              private var busy = false
+
+              @Volatile private var lastResult: TotalCaptureResult? = null
+              @Volatile private var pending: CompletableDeferred<File>? = null
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val crashFile = File(filesDir, "crash.txt")
+                  val prevHandler = Thread.getDefaultUncaughtExceptionHandler()
+                  Thread.setDefaultUncaughtExceptionHandler { t, e ->
+                      try { crashFile.writeText(android.util.Log.getStackTraceString(e)) } catch (_: Throwable) {}
+                      prevHandler?.uncaughtException(t, e)
+                  }
+                  if (crashFile.exists()) {
+                      val report = crashFile.readText()
+                      crashFile.delete()
+                      val tv = TextView(this).apply {
+                          text = "COKME RAPORU:\n\n$report"
+                          setTextColor(Color.WHITE)
+                          textSize = 11f
+                          setTextIsSelectable(true)
+                          setPadding(dp(12), dp(12), dp(12), dp(12))
+                      }
+                      val btn = Button(this).apply { text = "Uygulamayi Baslat"; setOnClickListener { recreate() } }
+                      val box = LinearLayout(this).apply {
+                          orientation = LinearLayout.VERTICAL
+                          setBackgroundColor(Color.BLACK)
+                          addView(btn)
+                          addView(ScrollView(this@MainActivity).apply { addView(tv) })
+                      }
+                      setContentView(box)
+                      return
+                  }
+
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  cm = getSystemService(CAMERA_SERVICE) as CameraManager
+                  bgThread = HandlerThread("cam-bg").also { it.start() }
+                  bg = Handler(bgThread.looper)
+                  buildUi()
+                  discoverLenses()
+                  updateLensUi()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                      if (textureView.isAvailable) startCamera()
+                  } else {
+                      requestPermissions(arrayOf(Manifest.permission.CAMERA), 101)
+                  }
+              }
+
+              override fun onPause() {
+                  camJob?.cancel()
+                  closeCamera()
+                  super.onPause()
+              }
+
+              override fun onDestroy() {
+                  scope.cancel()
+                  bgThread.quitSafely()
+                  super.onDestroy()
+              }
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                      discoverLenses()
+                      updateLensUi()
+                      if (textureView.isAvailable) startCamera()
+                  } else {
+                      status("Kamera izni reddedildi.")
+                  }
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun buildUi() {
+                  val sw = resources.displayMetrics.widthPixels
+                  val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+
+                  textureView = TextureView(this)
+                  root.addView(
+                      textureView,
+                      FrameLayout.LayoutParams(sw, sw * 4 / 3, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+                  )
+                  textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                      override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) = startCamera()
+                      override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+                      override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean = true
+                      override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+                  }
+
+                  statusView = TextView(this).apply {
+                      setTextColor(Color.WHITE)
+                      textSize = 13f
+                      setPadding(dp(12), dp(10), dp(12), dp(10))
+                      setBackgroundColor(0x88000000.toInt())
+                  }
+                  root.addView(
+                      statusView,
+                      FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT,
+                          Gravity.TOP
+                      )
+                  )
+
+                  val panel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(12), dp(16), dp(24))
+                      setBackgroundColor(0xCC000000.toInt())
+                  }
+                  countView = TextView(this).apply {
+                      setTextColor(Color.WHITE)
+                      textSize = 15f
+                      text = "Odak Basamak Sayisi: $frameCount kare"
+                  }
+                  val seek = SeekBar(this).apply {
+                      max = 20
+                      progress = frameCount - 5
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                              frameCount = p + 5
+                              countView.text = "Odak Basamak Sayisi: $frameCount kare"
+                          }
+                          override fun onStartTrackingTouch(sb: SeekBar?) {}
+                          override fun onStopTrackingTouch(sb: SeekBar?) {}
+                      })
+                  }
+                  btn06 = Button(this).apply { text = "0.6x (Makro)"; setOnClickListener { selectLens("0.6x") } }
+                  btn1 = Button(this).apply { text = "1x (Ana)"; setOnClickListener { selectLens("1x") } }
+                  shutter = Button(this).apply { text = "BASLAT"; setOnClickListener { onShutter() } }
+
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                  }
+                  row.addView(btn06, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  row.addView(shutter, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.3f))
+                  row.addView(btn1, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+                  panel.addView(countView)
+                  panel.addView(seek)
+                  panel.addView(row)
+                  root.addView(
+                      panel,
+                      FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT,
+                          Gravity.BOTTOM
+                      )
+                  )
+                  setContentView(root)
+              }
+
+              private fun status(msg: String) {
+                  runOnUiThread { statusView.text = msg }
+              }
+
+              private fun toast(msg: String) {
+                  runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+              }
+
+              private fun updateLensUi() {
+                  btn06.isEnabled = lenses.containsKey("0.6x")
+                  btn1.isEnabled = lenses.containsKey("1x")
+                  btn06.alpha = if (selected == "0.6x") 1f else 0.5f
+                  btn1.alpha = if (selected == "1x") 1f else 0.5f
+              }
+
+              private fun selectLens(key: String) {
+                  if (busy || !lenses.containsKey(key)) return
+                  selected = key
+                  updateLensUi()
+                  startCamera()
+              }
+
+              private fun discoverLenses() {
+                  val candidates = ArrayList<Lens>()
+
+                  fun inspect(openId: String, physId: String?, ch: CameraCharacteristics) {
+                      if (ch.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK) return
+                      val f = ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: return
+                      val minF = ch.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+                      val sz = ch.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+                      val eq = if (sz != null && sz.width > 0f && sz.height > 0f) {
+                          f * 43.27f / hypot(sz.width, sz.height)
+                      } else {
+                          if (f < 3.5f) 13f else 24f
+                      }
+                      val label = when {
+                          eq < 18.5f || f < 3.2f || (openId == "2" && physId == null) -> "0.6x"
+                          eq in 18.5f..35f || openId == "0" -> "1x"
+                          else -> return
+                      }
+                      candidates.add(Lens(label, openId, physId, ch, minF, f))
+                  }
+
+                  val allIds = LinkedHashSet<String>()
+                  try { allIds.addAll(cm.cameraIdList.toList()) } catch (_: Exception) {}
+                  // Samsung S23 Ultra dogrudan acilabilen kamera ID'leri (0=1x, 2=0.6x)
+                  for (extra in listOf("0", "2")) allIds.add(extra)
+
+                  for (id in allIds) {
+                      val ch = try { cm.getCameraCharacteristics(id) } catch (_: Exception) { continue }
+                      if (ch.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK) continue
+                      inspect(id, null, ch)
+                      val phys = try { ch.physicalCameraIds } catch (_: Exception) { emptySet<String>() }
+                      for (p in phys) {
+                          try { inspect(id, p, cm.getCameraCharacteristics(p)) } catch (_: Exception) {}
+                      }
+                  }
+
+                  lenses.clear()
+                  for (key in listOf("1x", "0.6x")) {
+                      val best = candidates.filter { it.label == key }
+                          .sortedWith(
+                              compareByDescending<Lens> { it.minFocus > 0f }
+                                  .thenByDescending { it.physicalId == null }
+                                  .thenByDescending { it.minFocus }
+                          ).firstOrNull()
+                      if (best != null) lenses[key] = best
+                  }
+
+                  if (!lenses.containsKey(selected) && lenses.isNotEmpty()) {
+                      selected = lenses.keys.first()
+                  }
+              }
+
+              private fun closeCamera() {
+                  try { session?.close() } catch (_: Exception) {}
+                  try { camera?.close() } catch (_: Exception) {}
+                  try { reader?.close() } catch (_: Exception) {}
+                  try { previewSurface?.release() } catch (_: Exception) {}
+                  session = null; camera = null; reader = null; previewSurface = null
+              }
+
+              private fun startCamera() {
+                  if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
+                  if (!textureView.isAvailable) return
+                  camJob?.cancel()
+                  camJob = scope.launch {
+                      try {
+                          closeCamera()
+                          val lens = lenses[selected]
+                          if (lens == null) {
+                              status("Kamera lensi bulunamadi.")
+                              return@launch
+                          }
+                          val map = lens.chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                              ?: throw IllegalStateException("Stream haritasi alinamadi")
+
+                          val prevSizes = map.getOutputSizes(SurfaceTexture::class.java) ?: arrayOf(Size(1280, 960))
+                          val prev = prevSizes
+                              .filter { it.width * 3 == it.height * 4 && it.width <= 1920 }
+                              .maxByOrNull { it.width * it.height }
+                              ?: prevSizes.firstOrNull() ?: Size(1280, 960)
+
+                          val jpgAll = map.getOutputSizes(ImageFormat.JPEG) ?: arrayOf(Size(4000, 3000))
+                          val jpg = jpgAll
+                              .filter { it.width * 3 == it.height * 4 && it.width * it.height in 8_000_000..13_000_000 }
+                              .maxByOrNull { it.width * it.height }
+                              ?: jpgAll.filter { it.width.toLong() * it.height <= 13_000_000L }
+                                  .maxByOrNull { it.width * it.height }
+                              ?: throw IllegalStateException("13 MP veya alti JPEG boyutu bulunamadi")
+
+                          val dev = openDevice(lens.openId)
+                          camera = dev
+                          val rd = ImageReader.newInstance(jpg.width, jpg.height, ImageFormat.JPEG, 5)
+                          rd.setOnImageAvailableListener(imageListener, bg)
+                          reader = rd
+
+                          val st = textureView.surfaceTexture!!
+                          st.setDefaultBufferSize(prev.width, prev.height)
+                          val ps = Surface(st)
+                          previewSurface = ps
+
+                          session = createSessionWithFallback(dev, listOf(ps, rd.surface), lens.physicalId)
+                          session!!.setRepeatingRequest(previewBuilder().build(), repeatCb, bg)
+
+                          val cmDist = if (lens.minFocus > 0f) " (~${(100f / lens.minFocus).toInt()} cm)" else ""
+                          status(
+                              "${lens.label} (ID:${lens.openId}${lens.physicalId?.let { "/$it" } ?: ""}) • " +
+                                  "Min Odak: ${"%.1f".format(lens.minFocus)} dpt$cmDist • ${jpg.width}x${jpg.height}"
+                          )
+                      } catch (e: CancellationException) {
+                          throw e
+                      } catch (e: Exception) {
+                          status("Kamera acilamadi: ${e.message}")
+                      }
+                  }
+              }
+
+              @SuppressLint("MissingPermission")
+              private suspend fun openDevice(id: String): CameraDevice = suspendCancellableCoroutine { c ->
+                  cm.openCamera(id, mainExecutor, object : CameraDevice.StateCallback() {
+                      override fun onOpened(d: CameraDevice) {
+                          if (c.isActive) c.resume(d) else d.close()
+                      }
+                      override fun onDisconnected(d: CameraDevice) {
+                          d.close()
+                          if (c.isActive) c.resumeWithException(IllegalStateException("Kamera baglantisi kesildi"))
+                      }
+                      override fun onError(d: CameraDevice, error: Int) {
+                          d.close()
+                          if (c.isActive) c.resumeWithException(IllegalStateException("Kamera cihaz hatasi: $error"))
+                      }
+                  })
+              }
+
+              private suspend fun createSessionWithFallback(
+                  dev: CameraDevice,
+                  surfaces: List<Surface>,
+                  physicalId: String?
+              ): CameraCaptureSession {
+                  if (physicalId != null) {
+                      try {
+                          return createSession(dev, surfaces, physicalId)
+                      } catch (_: Exception) {
+                          // Fiziksel kamera ID oturumu reddedilirse mantiksal kamera uzerinden devam et
+                      }
+                  }
+                  return createSession(dev, surfaces, null)
+              }
+
+              private suspend fun createSession(
+                  dev: CameraDevice,
+                  surfaces: List<Surface>,
+                  physicalId: String?
+              ): CameraCaptureSession = suspendCancellableCoroutine { c ->
+                  val outs = surfaces.map { s ->
+                      OutputConfiguration(s).also { oc ->
+                          if (physicalId != null) oc.setPhysicalCameraId(physicalId)
+                      }
+                  }
+                  val cfg = SessionConfiguration(
+                      SessionConfiguration.SESSION_REGULAR, outs, mainExecutor,
+                      object : CameraCaptureSession.StateCallback() {
+                          override fun onConfigured(s: CameraCaptureSession) {
+                              if (c.isActive) c.resume(s) else s.close()
+                          }
+                          override fun onConfigureFailed(s: CameraCaptureSession) {
+                              if (c.isActive) c.resumeWithException(IllegalStateException("Kamera oturumu basarisiz"))
+                          }
+                      }
+                  )
+                  dev.createCaptureSession(cfg)
+              }
+
+              private fun previewBuilder(): CaptureRequest.Builder {
+                  val b = camera!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                  b.addTarget(previewSurface!!)
+                  b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                  return b
+              }
+
+              private val repeatCb = object : CameraCaptureSession.CaptureCallback() {
+                  override fun onCaptureCompleted(
+                      s: CameraCaptureSession, r: CaptureRequest, result: TotalCaptureResult
+                  ) {
+                      lastResult = result
+                  }
+              }
+
+              private val imageListener = ImageReader.OnImageAvailableListener { r ->
+                  val img = r.acquireNextImage() ?: return@OnImageAvailableListener
+                  try {
+                      val buf = img.planes[0].buffer
+                      val bytes = ByteArray(buf.remaining())
+                      buf.get(bytes)
+                      val f = File(cacheDir, "fs_${System.nanoTime()}.jpg")
+                      f.writeBytes(bytes)
+                      pending?.complete(f)
+                  } catch (e: Exception) {
+                      pending?.completeExceptionally(e)
+                  } finally {
+                      img.close()
+                  }
+              }
+
+              private fun applyBurst(b: CaptureRequest.Builder, diopter: Float) {
+                  b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                  b.set(CaptureRequest.LENS_FOCUS_DISTANCE, diopter)
+                  b.set(CaptureRequest.CONTROL_AE_LOCK, true)
+                  b.set(CaptureRequest.CONTROL_AWB_LOCK, true)
+                  b.set(
+                      CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                      CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                  )
+                  b.set(
+                      CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                      CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                  )
+              }
+
+              private fun focusSteps(n: Int, near: Float): FloatArray = FloatArray(n) { i ->
+                  val t = i / (n - 1f)
+                  FAR_DIOPTER + (near - FAR_DIOPTER) * (1f - t).pow(GAMMA)
+              }
+
+              private fun onShutter() {
+                  if (busy) return
+                  val lens = lenses[selected] ?: return
+                  if (lens.minFocus <= 0f) {
+                      toast("Bu lens manuel odak desteklemiyor (minFocus=0)")
+                      return
+                  }
+                  busy = true
+                  shutter.isEnabled = false
+                  btn06.isEnabled = false
+                  btn1.isEnabled = false
+
+                  scope.launch {
+                      val files = ArrayList<File>()
+                      try {
+                          runBurst(lens, files)
+                          try { session?.setRepeatingRequest(previewBuilder().build(), repeatCb, bg) } catch (_: Exception) {}
+
+                          status("Tam cozunurlukte hizalaniyor ve parcalar birlestiriliyor...")
+                          val rotation = lens.chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+                          val bmp = FocusStackProcessor.stack(files, rotation) { d, t ->
+                              status("Tam cozunurluk: ${d * 100 / t}%")
+                          }
+                          status("Galeriye kaydediliyor...")
+                          val name = withContext(Dispatchers.IO) { saveToGallery(bmp) }
+                          bmp.recycle()
+                          status("Tamamlandi: $OUT_DIR/$name")
+                          toast("Kaydedildi: $OUT_DIR/$name")
+                      } catch (e: CancellationException) {
+                          throw e
+                      } catch (e: Throwable) {
+                          status("Hata: ${e.message}")
+                          toast("Hata: ${e.message}")
+                      } finally {
+                          pending = null
+                          try { session?.setRepeatingRequest(previewBuilder().build(), repeatCb, bg) } catch (_: Exception) {}
+                          files.forEach { it.delete() }
+                          busy = false
+                          shutter.isEnabled = true
+                          updateLensUi()
+                      }
+                  }
+              }
+
+              private suspend fun runBurst(lens: Lens, files: MutableList<File>) {
+                  val sess = session ?: throw IllegalStateException("Kamera oturumu hazir degil")
+                  val dev = camera ?: throw IllegalStateException("Kamera cihazi hazir degil")
+                  val rd = reader ?: throw IllegalStateException("ImageReader hazir degil")
+                  val n = frameCount
+                  val steps = focusSteps(n, lens.minFocus)
+
+                  status("AE/AWB Pozlama ve Renk kilitleniyor...")
+                  var waited = 0
+                  while (waited < 2000) {
+                      val st = lastResult?.get(CaptureResult.CONTROL_AE_STATE)
+                      if (st == CaptureResult.CONTROL_AE_STATE_CONVERGED || st == CaptureResult.CONTROL_AE_STATE_LOCKED) break
+                      delay(80); waited += 80
+                  }
+
+                  val lockB = previewBuilder()
+                  applyBurst(lockB, steps[0])
+                  sess.setRepeatingRequest(lockB.build(), repeatCb, bg)
+                  delay(350)
+
+                  for (i in 0 until n) {
+                      status("Cekiliyor ${i + 1}/$n (Odak: ${"%.2f".format(steps[i])} dpt)")
+                      val rb = previewBuilder()
+                      applyBurst(rb, steps[i])
+                      val focusTag = Any()
+                      rb.setTag(focusTag)
+                      sess.setRepeatingRequest(rb.build(), repeatCb, bg)
+
+                      delay(SETTLE_MS)
+                      // Never accept a stationary result from the previous focus command.
+                      withTimeout(2_000) {
+                          while (true) {
+                              val result = lastResult
+                              if (result?.request?.tag === focusTag &&
+                                  result.get(CaptureResult.LENS_STATE) != CaptureResult.LENS_STATE_MOVING) break
+                              delay(25)
+                          }
+                      }
+
+                      val cb = dev.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                      cb.addTarget(rd.surface)
+                      applyBurst(cb, steps[i])
+                      cb.set(CaptureRequest.JPEG_QUALITY, 100.toByte())
+                      cb.set(CaptureRequest.JPEG_ORIENTATION, 0)
+
+                      val d = CompletableDeferred<File>()
+                      pending = d
+                      sess.capture(cb.build(), null, bg)
+                      files.add(withTimeout(10_000) { d.await() })
+                  }
+                  pending = null
+              }
+
+              private fun saveToGallery(bmp: Bitmap): String {
+                  val name = "S23U_Stack_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
+                  val values = ContentValues().apply {
+                      put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                      put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                      put(MediaStore.Images.Media.RELATIVE_PATH, OUT_DIR)
+                      put(MediaStore.Images.Media.IS_PENDING, 1)
+                  }
+                  val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                      ?: throw IllegalStateException("Galeri kaydi olusturulamadi")
+                  contentResolver.openOutputStream(uri)!!.use { bmp.compress(Bitmap.CompressFormat.JPEG, 98, it) }
+                  values.clear()
+                  values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                  contentResolver.update(uri, values, null, null)
+                  return name
+              }
+          }
+          EOF
+
+      - name: APK Derle
         run: gradle assembleDebug --stacktrace --no-daemon
 
-      - name: APK yukle
+      - name: APK Artifact Yukle
         uses: actions/upload-artifact@v4
         with:
-          name: S23Ultra-FocusStack-apk
+          name: S23Ultra-FocusStack-APK
           path: app/build/outputs/apk/debug/app-debug.apk
